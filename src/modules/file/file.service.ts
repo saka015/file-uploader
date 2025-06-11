@@ -44,71 +44,167 @@ export class FileService {
     return { uploadUrl: data.signedUrl, filePath };
   }
 
-  async saveFileMetadata(filePath: string, fileName: string, mimeType: string) {
-    try {
-      return await this.prisma.file.create({
-        data: {
-          filePath,
-          fileName,
-          contentType: mimeType,
-          size: 0, // This should be updated with actual file size
-          userId: 'system', // This should be updated with actual user ID from your auth system
-        },
-      });
-    } catch (error) {
-      throw new InternalServerErrorException('Failed to save file metadata');
+// async saveFileMetadata(filePath: string, fileName: string, mimeType: string) {
+//   try {
+//     return await this.prisma.file.create({
+//       data: {
+//         filePath,
+//         fileName,
+//         contentType: mimeType,
+//         size: 0,
+//         userId: 'system',
+//       },
+//     });
+//   } catch (error) {
+//     console.error('Error saving file metadata:', error);
+//     throw new InternalServerErrorException('Failed to save file metadata');
+//   }
+// }
+
+async saveFileMetadata(filePath: string, fileName: string, mimeType: string) {
+  try {
+    const fileData = {
+      file_path: filePath,
+      file_name: fileName,
+      content_type: mimeType,
+      size: 0,
+      user_id: 'system',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    // First, try to check if the file already exists
+    const { data: existingFile, error: selectError } = await this.supabase
+      .from('files')
+      .select('*')
+      .eq('file_path', filePath)
+      .single();
+
+    if (selectError && selectError.code !== 'PGRST116') {
+      console.error('Error checking existing file:', selectError);
+      throw new InternalServerErrorException(`Failed to check existing file: ${selectError.message}`);
     }
+
+    if (existingFile) {
+      // Update existing file
+      const { data, error } = await this.supabase
+        .from('files')
+        .update({
+          file_name: fileName,
+          content_type: mimeType,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('file_path', filePath)
+        .select()
+        .single();
+
+      if (error) {
+        console.error('Error updating file metadata:', error);
+        throw new InternalServerErrorException(`Failed to update file metadata: ${error.message}`);
+      }
+
+      return data;
+    } else {
+      // Create new file record
+      const { data, error } = await this.supabase
+        .from('files')
+        .insert(fileData)
+        .select()
+        .single();
+
+      if (error) {
+        console.error('Error creating file metadata:', error);
+        throw new InternalServerErrorException(`Failed to create file metadata: ${error.message}`);
+      }
+
+      return data;
+    }
+  } catch (error) {
+    console.error('Error in saveFileMetadata:', error);
+    throw new InternalServerErrorException(`Failed to save file metadata: ${error.message}`);
   }
+}
+
+
 
   async getFile(fileId: string) {
-    const file = await this.prisma.file.findUnique({ 
-      where: { id: fileId },
-      select: {
-        id: true,
-        fileName: true,
-        filePath: true,
-        contentType: true,
-        size: true,
-        createdAt: true,
+    try {
+      const { data: file, error: dbError } = await this.supabase
+        .from('files')
+        .select('id, file_name, file_path, content_type, size, created_at')
+        .eq('id', fileId)
+        .eq('is_deleted', false)
+        .single();
+
+      if (dbError || !file) {
+        throw new NotFoundException('File not found');
       }
-    });
 
-    if (!file) {
-      throw new NotFoundException('File not found');
+      // Generate public URL for the file
+      const { data: publicUrlData } = this.supabase.storage
+        .from('files')
+        .getPublicUrl(file.file_path);
+
+      return { 
+        file: {
+          id: file.id,
+          fileName: file.file_name,
+          filePath: file.file_path,
+          contentType: file.content_type,
+          size: file.size,
+          createdAt: file.created_at,
+        }, 
+        downloadUrl: publicUrlData.publicUrl
+      };
+    } catch (error) {
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      console.error('Error getting file:', error);
+      throw new InternalServerErrorException(`Failed to get file: ${error.message}`);
     }
-
-    const { data, error } = await this.supabase.storage
-      .from('files')
-      .download(file.filePath);
-
-    if (error) {
-      throw new InternalServerErrorException('Failed to download file from storage');
-    }
-
-    return { file, data };
   }
 
   async deleteFile(fileId: string) {
-    const file = await this.prisma.file.findUnique({ where: { id: fileId } });
-    
-    if (!file) {
-      throw new NotFoundException('File not found');
-    }
-
-    const { error: storageError } = await this.supabase.storage
-      .from('files')
-      .remove([file.filePath]);
-
-    if (storageError) {
-      throw new InternalServerErrorException('Failed to delete file from storage');
-    }
-
     try {
-      await this.prisma.file.delete({ where: { id: fileId } });
-    } catch (error) {
-      throw new InternalServerErrorException('Failed to delete file metadata');
-    }
+      const { data: file, error: dbError } = await this.supabase
+        .from('files')
+        .select('id, file_path')
+        .eq('id', fileId)
+        .eq('is_deleted', false)
+        .single();
 
-    return { message: 'File deleted successfully' };
+      if (dbError || !file) {
+        throw new NotFoundException('File not found');
+      }
+
+      const { error: storageError } = await this.supabase.storage
+        .from('files')
+        .remove([file.file_path]);
+
+      if (storageError) {
+        throw new InternalServerErrorException('Failed to delete file from storage');
+      }
+
+      const { error: updateError } = await this.supabase
+        .from('files')
+        .update({ 
+          is_deleted: true, 
+          updated_at: new Date().toISOString() 
+        })
+        .eq('id', fileId);
+
+      if (updateError) {
+        throw new InternalServerErrorException('Failed to delete file metadata');
+      }
+
+      return { message: 'File deleted successfully' };
+    } catch (error) {
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      console.error('Error deleting file:', error);
+      throw new InternalServerErrorException(`Failed to delete file: ${error.message}`);
+    }
   }
 }
